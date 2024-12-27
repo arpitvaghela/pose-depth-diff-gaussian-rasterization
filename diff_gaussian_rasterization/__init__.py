@@ -27,6 +27,7 @@ def rasterize_gaussians(
     scales,
     rotations,
     cov3Ds_precomp,
+    viewmatrix,
     raster_settings,
 ):
     return _RasterizeGaussians.apply(
@@ -38,6 +39,7 @@ def rasterize_gaussians(
         scales,
         rotations,
         cov3Ds_precomp,
+        viewmatrix,
         raster_settings,
     )
 
@@ -53,6 +55,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         scales,
         rotations,
         cov3Ds_precomp,
+        viewmatrix,
         raster_settings,
     ):
 
@@ -66,7 +69,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             rotations,
             raster_settings.scale_modifier,
             cov3Ds_precomp,
-            raster_settings.viewmatrix,
+            viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
             raster_settings.tanfovy,
@@ -94,7 +97,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, viewmatrix)
         return color, radii, depth
 
     @staticmethod
@@ -103,7 +106,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, viewmatrix = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -114,11 +117,12 @@ class _RasterizeGaussians(torch.autograd.Function):
                 rotations, 
                 raster_settings.scale_modifier, 
                 cov3Ds_precomp, 
-                raster_settings.viewmatrix, 
+                viewmatrix, 
                 raster_settings.projmatrix, 
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
-                grad_out_color, 
+                grad_out_color,
+                grad_depth,
                 sh, 
                 raster_settings.sh_degree, 
                 raster_settings.campos,
@@ -140,6 +144,43 @@ class _RasterizeGaussians(torch.autograd.Function):
         else:
              grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
 
+        if viewmatrix.requires_grad:
+            grad_viewmat = torch.zeros_like(viewmatrix)
+            R = viewmatrix[..., :3, :3]
+
+            # Denote ProjectGaussians for a single Gaussian (mean3d, q, s)
+            # viemwat = [R, t] as:
+            #
+            #   f(mean3d, q, s, R, t, intrinsics)
+            #       = g(R @ mean3d + t,
+            #           R @ cov3d_world(q, s) @ R^T ))
+            #
+            # Then, the Jacobian w.r.t., t is:
+            #
+            #   d f / d t = df / d mean3d @ R^T
+            #
+            # and, in the context of fine tuning camera poses, it is reasonable
+            # to assume that
+            #
+            #   d f / d R_ij =~ \sum_l d f / d t_l * d (R @ mean3d)_l / d R_ij
+            #                = d f / d_t_i * mean3d[j]
+            #
+            # Gradients for R and t can then be obtained by summing over
+            # all the Gaussians.
+            v_mean3d_cam = torch.matmul(grad_means3D, R.transpose(-1, -2))
+
+            # gradient w.r.t. view matrix translation
+            grad_viewmat[..., :3, 3] = v_mean3d_cam.sum(-2)
+
+            # gradent w.r.t. view matrix rotation
+            for j in range(3):
+                for l in range(3):
+                    grad_viewmat[..., j, l] = torch.dot(
+                        v_mean3d_cam[..., j], means3D[..., l]
+                    )
+        else:
+            grad_viewmat = None
+
         grads = (
             grad_means3D,
             grad_means2D,
@@ -149,6 +190,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_scales,
             grad_rotations,
             grad_cov3Ds_precomp,
+            grad_viewmat,
             None,
         )
 
@@ -161,7 +203,7 @@ class GaussianRasterizationSettings(NamedTuple):
     tanfovy : float
     bg : torch.Tensor
     scale_modifier : float
-    viewmatrix : torch.Tensor
+    # viewmatrix : torch.Tensor
     projmatrix : torch.Tensor
     sh_degree : int
     campos : torch.Tensor
@@ -173,18 +215,18 @@ class GaussianRasterizer(nn.Module):
         super().__init__()
         self.raster_settings = raster_settings
 
-    def markVisible(self, positions):
+    def markVisible(self, positions, viewmatrix):
         # Mark visible points (based on frustum culling for camera) with a boolean 
         with torch.no_grad():
             raster_settings = self.raster_settings
             visible = _C.mark_visible(
                 positions,
-                raster_settings.viewmatrix,
+                viewmatrix,
                 raster_settings.projmatrix)
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, viewmatrix, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
         
         raster_settings = self.raster_settings
 
@@ -216,6 +258,7 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
+            viewmatrix,
             raster_settings, 
         )
 
